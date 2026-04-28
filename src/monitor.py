@@ -17,7 +17,7 @@ from data_fetcher import fetch_spot, fetch_hist
 FEISHU_WEBHOOK = os.environ.get('FEISHU_WEBHOOK', '')
 
 SYMBOL = "600839"
-MONITORED_SYMBOLS = [SYMBOL, "600166"]
+MONITORED_SYMBOLS = ["600166"]
 STOCK_LABELS = {
     "600839": "四川长虹",
     "600166": "福田汽车",
