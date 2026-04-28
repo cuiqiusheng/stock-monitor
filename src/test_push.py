@@ -11,10 +11,13 @@ import sys
 import time
 import logging
 from datetime import datetime
-from monitor import send_feishu, FEISHU_WEBHOOK, SYMBOL
+from monitor import send_feishu, FEISHU_WEBHOOK, MONITORED_SYMBOLS, STOCK_LABELS
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+TEST_SYMBOL = MONITORED_SYMBOLS[0] if MONITORED_SYMBOLS else "600166"
+TEST_STOCK_NAME = STOCK_LABELS.get(TEST_SYMBOL, TEST_SYMBOL)
 
 SCENARIOS = [
     {
@@ -63,7 +66,7 @@ def build_message(s):
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return f"""[测试] {s['signal_type']}
 
-股票：四川长虹 ({SYMBOL})
+股票：{TEST_STOCK_NAME} ({TEST_SYMBOL})
 当前价格：{s['price']:.2f} 元
 策略得分：{s['score']}
 触发因子：{', '.join(s['reasons'])}
@@ -95,7 +98,7 @@ def build_volatility_message(v):
 
     return f"""[测试] {emoji} 波动提醒 | {label}达 {abs_pct:.2f}%
 
-股票：四川长虹 ({SYMBOL})
+股票：{TEST_STOCK_NAME} ({TEST_SYMBOL})
 当前价格：{price:.2f} 元
 涨跌幅：{pct:+.2f}%
 突破阈值：{crossed}
