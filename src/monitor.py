@@ -17,6 +17,15 @@ from data_fetcher import fetch_spot, fetch_hist
 FEISHU_WEBHOOK = os.environ.get('FEISHU_WEBHOOK', '')
 
 SYMBOL = "600839"
+MONITORED_SYMBOLS = [SYMBOL, "600166"]
+STOCK_LABELS = {
+    "600839": "四川长虹",
+    "600166": "福田汽车",
+}
+
+PRICE_BANDS = {
+    "600839": (9.50, 10.50),
+}
 
 BASE_BUY_PRICE = 9.50
 BASE_SELL_PRICE = 10.50
@@ -41,7 +50,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ==================== 历史数据缓存 ====================
-_hist_cache = {'data': None, 'updated_at': None}
+_hist_cache = {}
 HIST_CACHE_TTL = 1800
 
 
@@ -56,16 +65,45 @@ def is_trading_time():
 
 # ==================== 数据获取 ====================
 
-def get_current_price():
+def _get_stock_name(symbol, spot=None):
+    if spot is not None:
+        name = spot.get('名称')
+        if name:
+            return name
+    return STOCK_LABELS.get(symbol, symbol)
+
+
+def _get_price_band(symbol, price, hist_data):
+    configured = PRICE_BANDS.get(symbol)
+    if configured:
+        return configured
+
+    ref_price = price
+    if hist_data is not None and len(hist_data) > 0:
+        close_price = hist_data.iloc[-1].get('close')
+        if close_price is not None and not pd.isna(close_price):
+            ref_price = float(close_price)
+
+    # 对新增股票采用动态区间，避免复用旧标的的固定阈值导致误判。
+    return (round(ref_price * 0.97, 2), round(ref_price * 1.03, 2))
+
+
+def _get_last_notify_file(symbol):
+    base, ext = os.path.splitext(LAST_NOTIFY_FILE)
+    ext = ext or '.txt'
+    return f"{base}_{symbol}{ext}"
+
+
+def get_current_price(symbol=SYMBOL):
     """获取实时价格"""
     try:
-        row = fetch_spot(SYMBOL)
+        row = fetch_spot(symbol)
         if row is None:
-            logger.error(f"未找到股票代码 {SYMBOL}")
+            logger.error(f"未找到股票代码 {symbol}")
             return None
         return float(row['最新价'])
     except Exception as e:
-        logger.error(f"获取价格失败: {e}")
+        logger.error(f"获取价格失败 ({symbol}): {e}")
         return None
 
 
@@ -76,21 +114,22 @@ _HIST_COLUMN_MAP = {
 }
 
 
-def get_historical_data(days=60):
+def get_historical_data(days=60, symbol=SYMBOL):
     """获取历史日线数据（带 30 分钟缓存，避免频繁请求被限流）"""
+    cache = _hist_cache.setdefault(symbol, {'data': None, 'updated_at': None})
     now = datetime.now()
-    if (_hist_cache['data'] is not None
-            and _hist_cache['updated_at']
-            and (now - _hist_cache['updated_at']).total_seconds() < HIST_CACHE_TTL):
-        return _hist_cache['data']
+    if (cache['data'] is not None
+            and cache['updated_at']
+            and (now - cache['updated_at']).total_seconds() < HIST_CACHE_TTL):
+        return cache['data']
 
     try:
         end_date = now.strftime('%Y%m%d')
         start_date = (now - timedelta(days=days)).strftime('%Y%m%d')
 
-        df = fetch_hist(SYMBOL, start_date, end_date)
+        df = fetch_hist(symbol, start_date, end_date)
         if df is None or df.empty:
-            return _hist_cache['data']
+            return cache['data']
 
         df.rename(columns=_HIST_COLUMN_MAP, inplace=True)
 
@@ -100,12 +139,12 @@ def get_historical_data(days=60):
 
         df = _calculate_indicators(df)
 
-        _hist_cache['data'] = df
-        _hist_cache['updated_at'] = now
+        cache['data'] = df
+        cache['updated_at'] = now
         return df
     except Exception as e:
-        logger.error(f"获取历史数据失败: {e}")
-        return _hist_cache['data']
+        logger.error(f"获取历史数据失败 ({symbol}): {e}")
+        return cache['data']
 
 
 # ==================== 技术指标 ====================
@@ -160,43 +199,44 @@ def _detect_divergence(df, lookback=20):
 
 # ==================== 资金流向 ====================
 
-def _get_fund_flow():
+def _get_fund_flow(symbol):
     """获取个股资金流向（失败时静默降级，不影响其他因子）"""
     try:
         import akshare as ak
-        df = ak.stock_individual_fund_flow(stock=SYMBOL, market="sh")
+        market = "sh" if symbol.startswith("6") else "sz"
+        df = ak.stock_individual_fund_flow(stock=symbol, market=market)
         if df is not None and not df.empty:
             return df
     except Exception as e:
-        logger.debug(f"获取资金流向失败: {e}")
+        logger.debug(f"获取资金流向失败 ({symbol}): {e}")
     return None
 
 
 # ==================== 综合评分 ====================
 
-def _calculate_score(price, hist_data):
+def _calculate_score(price, hist_data, symbol, base_buy_price, base_sell_price):
     """三因子综合评分：价格 + 技术 + 资金"""
     score = 0
     reasons = []
 
     if hist_data is None or len(hist_data) < 20:
-        if price <= BASE_BUY_PRICE:
+        if price <= base_buy_price:
             score += 1
-            reasons.append(f"价格≤{BASE_BUY_PRICE}")
-        elif price >= BASE_SELL_PRICE:
+            reasons.append(f"价格≤{base_buy_price:.2f}")
+        elif price >= base_sell_price:
             score -= 1
-            reasons.append(f"价格≥{BASE_SELL_PRICE}")
+            reasons.append(f"价格≥{base_sell_price:.2f}")
         return score, reasons
 
     latest = hist_data.iloc[-1]
 
     # === 价格因子 ===
-    if price <= BASE_BUY_PRICE:
+    if price <= base_buy_price:
         score += 1
-        reasons.append(f"价格≤{BASE_BUY_PRICE}")
-    elif price >= BASE_SELL_PRICE:
+        reasons.append(f"价格≤{base_buy_price:.2f}")
+    elif price >= base_sell_price:
         score -= 1
-        reasons.append(f"价格≥{BASE_SELL_PRICE}")
+        reasons.append(f"价格≥{base_sell_price:.2f}")
 
     # === 技术因子 ===
     rsi = latest.get('rsi')
@@ -220,21 +260,21 @@ def _calculate_score(price, hist_data):
     volume_ma5 = latest.get('volume_ma5')
     if (volume is not None and volume_ma5 is not None
             and not pd.isna(volume) and not pd.isna(volume_ma5) and volume_ma5 > 0):
-        if volume < volume_ma5 * VOLUME_RATIO and price <= BASE_BUY_PRICE + 0.3:
+        if volume < volume_ma5 * VOLUME_RATIO and price <= base_buy_price + 0.3:
             score += 1
             reasons.append("成交量萎缩")
 
     # === 资金因子 ===
-    fund_flow = _get_fund_flow()
+    fund_flow = _get_fund_flow(symbol)
     if fund_flow is not None:
         try:
             main_col = next((c for c in fund_flow.columns if '主力净流入' in c), None)
             if main_col:
                 main_flow = float(fund_flow[main_col].iloc[-1])
-                if main_flow > 0 and price <= BASE_BUY_PRICE + 0.3:
+                if main_flow > 0 and price <= base_buy_price + 0.3:
                     score += 1
                     reasons.append("主力净流入")
-                elif main_flow < 0 and price >= BASE_SELL_PRICE - 0.3:
+                elif main_flow < 0 and price >= base_sell_price - 0.3:
                     score -= 1
                     reasons.append("主力净流出")
         except Exception as e:
@@ -266,26 +306,32 @@ _VOLATILITY_THRESHOLDS = [3, 5, 7, 9]
 _volatility_alerted = {}  # key: "YYYY-MM-DD|up|3" -> True
 
 
-def check_volatility():
+def check_volatility(symbol=None):
     """检测涨跌幅是否突破阈值，每档每天只触发一次，高档自动补发低档"""
+    if symbol is None:
+        for s in MONITORED_SYMBOLS:
+            check_volatility(s)
+        return
+
     try:
-        spot = fetch_spot(SYMBOL)
+        spot = fetch_spot(symbol)
         if spot is None:
             return
         pct = float(spot['涨跌幅'])
         price = float(spot['最新价'])
     except Exception as e:
-        logger.error(f"波动检测获取行情失败: {e}")
+        logger.error(f"波动检测获取行情失败 ({symbol}): {e}")
         return
 
     today = datetime.now().strftime('%Y-%m-%d')
     direction = 'up' if pct >= 0 else 'down'
     abs_pct = abs(pct)
+    stock_name = _get_stock_name(symbol, spot)
 
     triggered = []
     for threshold in _VOLATILITY_THRESHOLDS:
         if abs_pct >= threshold:
-            key = f"{today}|{direction}|{threshold}"
+            key = f"{today}|{symbol}|{direction}|{threshold}"
             if key not in _volatility_alerted:
                 triggered.append(threshold)
                 _volatility_alerted[key] = True
@@ -310,7 +356,7 @@ def check_volatility():
 
     content = f"""{emoji} 波动提醒 | {label}达 {abs_pct:.2f}%
 
-股票：四川长虹 ({SYMBOL})
+股票：{stock_name} ({symbol})
 当前价格：{price:.2f} 元
 涨跌幅：{pct:+.2f}%
 突破阈值：{crossed}
@@ -319,7 +365,7 @@ def check_volatility():
 提示：{risk_note}"""
 
     if send_feishu(content):
-        logger.info(f"波动提醒推送: {pct:+.2f}% 突破 {crossed}")
+        logger.info(f"波动提醒推送: {stock_name}({symbol}) {pct:+.2f}% 突破 {crossed}")
 
 
 def _cleanup_old_alerts(today):
@@ -331,14 +377,31 @@ def _cleanup_old_alerts(today):
 
 # ==================== 主监控 ====================
 
-def check_and_notify():
+def check_and_notify(symbol=None):
     """主监控函数：综合三因子判断并推送"""
-    price = get_current_price()
+    if symbol is None:
+        for s in MONITORED_SYMBOLS:
+            check_and_notify(s)
+        return
+
+    try:
+        spot = fetch_spot(symbol)
+        if spot is None:
+            logger.error(f"未找到股票代码 {symbol}")
+            return
+        price = float(spot['最新价'])
+    except Exception as e:
+        logger.error(f"获取价格失败 ({symbol}): {e}")
+        return
+
+    stock_name = _get_stock_name(symbol, spot)
+    last_notify_file = _get_last_notify_file(symbol)
     if price is None:
         return
 
-    hist_data = get_historical_data(days=60)
-    score, reasons = _calculate_score(price, hist_data)
+    hist_data = get_historical_data(days=60, symbol=symbol)
+    base_buy_price, base_sell_price = _get_price_band(symbol, price, hist_data)
+    score, reasons = _calculate_score(price, hist_data, symbol, base_buy_price, base_sell_price)
 
     action = None
     signal_type = ""
@@ -355,14 +418,14 @@ def check_and_notify():
         action = "温和卖出"
         signal_type = "🟢 卖出信号"
     else:
-        logger.debug(f"无信号，当前价格 {price:.2f}，得分 {score}")
+        logger.debug(f"{stock_name}({symbol}) 无信号，当前价格 {price:.2f}，得分 {score}")
         return
 
     last_price = 0
     last_action = ""
-    if os.path.exists(LAST_NOTIFY_FILE):
+    if os.path.exists(last_notify_file):
         try:
-            with open(LAST_NOTIFY_FILE, 'r') as f:
+            with open(last_notify_file, 'r') as f:
                 raw = f.read().strip()
                 if raw and '|' in raw:
                     last_price, last_action = raw.split('|')
@@ -371,7 +434,7 @@ def check_and_notify():
             logger.warning(f"读取上次推送状态失败: {e}")
 
     if action == last_action and abs(price - last_price) < 0.2:
-        logger.debug("相同信号已推送过，跳过")
+        logger.debug(f"{stock_name}({symbol}) 相同信号已推送过，跳过")
         return
 
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -383,7 +446,7 @@ def check_and_notify():
 
     content = f"""{signal_type}
 
-股票：四川长虹 ({SYMBOL})
+股票：{stock_name} ({symbol})
 当前价格：{price:.2f} 元
 策略得分：{score}
 触发因子：{', '.join(reasons)}
@@ -392,13 +455,15 @@ def check_and_notify():
 建议操作：
 - 机动仓：{position_advice}
 - 底仓（70%）：继续持有"""
+    if symbol not in PRICE_BANDS:
+        content += f"\n- 动态参考区间：{base_buy_price:.2f} ~ {base_sell_price:.2f}"
 
     pushed = send_feishu(content)
 
     if pushed:
-        os.makedirs(os.path.dirname(LAST_NOTIFY_FILE), exist_ok=True)
-        with open(LAST_NOTIFY_FILE, 'w') as f:
+        os.makedirs(os.path.dirname(last_notify_file), exist_ok=True)
+        with open(last_notify_file, 'w') as f:
             f.write(f"{price}|{action}")
-        logger.info(f"信号推送成功: {action} at {price:.2f} (得分:{score})")
+        logger.info(f"信号推送成功: {stock_name}({symbol}) {action} at {price:.2f} (得分:{score})")
     else:
-        logger.error("推送失败")
+        logger.error(f"推送失败: {stock_name}({symbol})")

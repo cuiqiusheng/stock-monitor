@@ -6,7 +6,14 @@
 
 import time
 from datetime import datetime
-from monitor import check_and_notify, check_volatility, is_trading_time, send_feishu, logger
+from monitor import (
+    check_and_notify,
+    check_volatility,
+    is_trading_time,
+    send_feishu,
+    logger,
+    MONITORED_SYMBOLS,
+)
 from query import query_realtime, query_market
 
 TRADING_INTERVAL = 60
@@ -41,14 +48,15 @@ def _check_scheduled_push():
                 _daily_push_done[f"{key}_market"] = today
                 logger.info(f"{label}大盘推送成功")
 
-            stock = query_realtime()
+            stock_sections = [query_realtime(symbol=s) for s in MONITORED_SYMBOLS]
+            stock = "\n\n".join(stock_sections)
             if send_feishu(f"📊 {label} | 个股行情\n\n{stock}"):
                 _daily_push_done[f"{key}_stock"] = today
                 logger.info(f"{label}个股推送成功")
 
 
 if __name__ == "__main__":
-    logger.info("四川长虹监控容器启动")
+    logger.info(f"股票监控容器启动，监控标的: {', '.join(MONITORED_SYMBOLS)}")
     while True:
         try:
             _check_scheduled_push()
